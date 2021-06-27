@@ -251,11 +251,22 @@ func nextMethod(g *ui.Gui, v *ui.View) error {
 	return nil
 }
 
+type Result struct {
+	method string
+	url    string
+	path   string
+	proto  string
+	header http.Header
+	status string
+	body   string
+}
+
 func processRequest(g *ui.Gui, v *ui.View) error {
 	input_view, err := g.View("input-bar")
 	if err != nil {
 		return err
 	}
+
 	i_buf := input_view.ViewBufferLines()
 	if len(i_buf) <= 0 {
 		return nil
@@ -283,85 +294,69 @@ func processRequest(g *ui.Gui, v *ui.View) error {
 		request_body_data = []byte(req_buf)
 	}
 
-	resultsChan := make(chan string)
+	out, err := g.View("res-output")
+	if err != nil {
+		return err
+	}
+
+	resultsChan := make(chan Result, 1)
+	doneChan := make(chan bool, 1)
 
 	switch active_method {
 	case 0:
-		out, err := g.View("res-output")
-		if err != nil {
-			return err
-		}
-		go httpRequest(api_url, "GET", nil, out, resultsChan)
-		fmt.Fprintln(out, <-resultsChan)
+		go httpRequest(api_url, "GET", nil, out, resultsChan, doneChan)
 	case 1:
-		out, err := g.View("res-output")
-		if err != nil {
-			return err
-		}
-		go httpRequest(api_url, "POST", request_body_data, out, resultsChan)
-		fmt.Fprintln(out, <-resultsChan)
+		go httpRequest(api_url, "POST", request_body_data, out, resultsChan, doneChan)
 	case 2:
-		out, err := g.View("res-output")
-		if err != nil {
-			return err
-		}
-		go httpRequest(api_url, "DELETE", request_body_data, out, resultsChan)
-		fmt.Fprintln(out, <-resultsChan)
+		go httpRequest(api_url, "DELETE", request_body_data, out, resultsChan, doneChan)
 	case 3:
-		out, err := g.View("res-output")
+		go httpRequest(api_url, "PUT", request_body_data, out, resultsChan, doneChan)
+	}
+
+	select {
+	case result := <-resultsChan:
+		fmt.Fprintln(out, formatResponse(result))
+
+		history_view, err := g.View("history")
 		if err != nil {
 			return err
 		}
-		go httpRequest(api_url, "PUT", request_body_data, out, resultsChan)
-		fmt.Fprintln(out, <-resultsChan)
+
+		history_item := fmt.Sprintf("%s %s %s\n", result.method, result.url, result.status)
+		fmt.Fprintln(history_view, history_item)
+	case <-time.After(3 * time.Second):
+		fmt.Fprintln(out, "Error: Seems like something is wrong in your request :(")
+		doneChan <- true
 	}
+
+	close(resultsChan)
+	<-doneChan
 
 	return nil
 }
 
-func httpRequest(url, method string, body []byte, v *ui.View, ch chan string) error {
+func calculateDuration(start time.Time, v *ui.View) {
+	elapsed := time.Since(start).Seconds()
+	fmt.Fprintf(v, "Time: %f s\n", elapsed)
+}
+
+func httpRequest(url, method string, body []byte, v *ui.View, ch chan Result, done chan<- bool) error {
 	start := time.Now()
-	duration := time.Since(start).Seconds()
-	fmt.Fprintf(v, "Time: %f s\n", duration)
+	defer calculateDuration(start, v)
 
 	client := &http.Client{}
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	req.Header.Add("content-type", "application/json")
 	if err != nil {
-		ch <- fmt.Sprintf("Error: %s\n", err.Error())
-		return nil
+		return err
 	}
 
 	res, err := client.Do(req)
 	if err != nil {
-		ch <- fmt.Sprintf("Error: %s\n", err.Error())
-		return nil
+		return err
 	}
 
-	result, err := formatResponse(res)
-	if err != nil {
-		ch <- fmt.Sprintf("Error: %s\n", err.Error())
-		return nil
-	}
 	defer res.Body.Close()
-
-	ch <- result
-
-	return nil
-}
-
-type Result struct {
-	method string
-	url    string
-	path   string
-	proto  string
-	header http.Header
-	status string
-	body   string
-}
-
-func formatResponse(res *http.Response) (string, error) {
-	var resultStr string
 
 	r := Result{
 		method: res.Request.Method,
@@ -372,30 +367,42 @@ func formatResponse(res *http.Response) (string, error) {
 		header: res.Header,
 	}
 
-	body, err := io.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	r.body = string(body)
+	r.body = string(b)
 
-	resultStr += fmt.Sprintf("%s %s %s\n", r.method, r.path, r.proto)
-	resultStr += fmt.Sprintf("Status %s \n", r.status)
+	ch <- r
+	done <- true
+
+	return nil
+}
+
+func formatResponse(result Result) string {
+	var resultStr string
+
+	resultStr += fmt.Sprintf("%s %s %s\n", result.method, result.path, result.proto)
+	resultStr += fmt.Sprintf("Status %s \n", result.status)
 	resultStr += "\n"
 
-	for name, headers := range r.header {
+	for name, headers := range result.header {
 		for _, h := range headers {
 			resultStr += fmt.Sprintf("%s => %s\n", name, h)
 		}
 	}
 
 	resultStr += "\n"
-	resultStr += fmt.Sprintf("body  \n %s", r.body)
+	resultStr += fmt.Sprintf("body  \n %s\n", result.body)
 
-	history = append(history, resultStr)
+	resultStr += "---------------------"
+	resultStr += "\n"
 
-	return resultStr, nil
+	return resultStr
 }
+
+// Should I save a simple file for recovery on next interaction?
 
 // func saveRequest(result Result) error {
 // 	content := fmt.Sprintf("%s %s/%s %s\n", result.method, result.url, result.path, result.status)
