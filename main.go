@@ -176,10 +176,18 @@ func initBindings(g *ui.Gui) error {
 	if err := g.SetKeybinding("", ui.KeyTab, ui.ModNone, nextView); err != nil {
 		return err
 	}
-	if err := g.SetKeybinding("", ui.KeyCtrlS, ui.ModNone, processRequest); err != nil {
+	if err := g.SetKeybinding("", ui.KeyCtrlS, ui.ModNone, func(g *ui.Gui, v *ui.View) error {
+		go func(gui *ui.Gui) {
+			processRequest(gui)
+		}(g)
+		return nil
+	}); err != nil {
 		return err
 	}
 	if err := g.SetKeybinding("", ui.KeyCtrlL, ui.ModNone, clear); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("popup", ui.KeyEnter, ui.ModNone, removePopup); err != nil {
 		return err
 	}
 	if err := g.SetKeybinding("method", ui.KeySpace, ui.ModNone, nextMethod); err != nil {
@@ -259,9 +267,10 @@ type Result struct {
 	header http.Header
 	status string
 	body   string
+	err    error
 }
 
-func processRequest(g *ui.Gui, v *ui.View) error {
+func processRequest(g *ui.Gui) error {
 	input_view, err := g.View("input-bar")
 	if err != nil {
 		return err
@@ -299,61 +308,50 @@ func processRequest(g *ui.Gui, v *ui.View) error {
 		return err
 	}
 
-	resultsChan := make(chan Result, 1)
-	doneChan := make(chan bool, 1)
+	start := time.Now()
+
+	var result Result
 
 	switch active_method {
 	case 0:
-		go httpRequest(api_url, "GET", nil, out, resultsChan, doneChan)
+		result = httpRequest(api_url, "GET", nil)
 	case 1:
-		go httpRequest(api_url, "POST", request_body_data, out, resultsChan, doneChan)
+		result = httpRequest(api_url, "POST", request_body_data)
 	case 2:
-		go httpRequest(api_url, "DELETE", request_body_data, out, resultsChan, doneChan)
+		result = httpRequest(api_url, "DELETE", request_body_data)
 	case 3:
-		go httpRequest(api_url, "PUT", request_body_data, out, resultsChan, doneChan)
+		result = httpRequest(api_url, "PUT", request_body_data)
 	}
 
-	select {
-	case result := <-resultsChan:
-		fmt.Fprintln(out, formatResponse(result))
+	if result.err != nil {
+		fmt.Fprintf(out, "Error: %s\n", result.err.Error())
+		return nil
+	}
+	fmt.Fprintf(out, "Time: %f s\n", time.Since(start).Seconds())
+	fmt.Fprintln(out, formatResponse(result))
 
-		history_view, err := g.View("history")
-		if err != nil {
-			return err
-		}
-
-		history_item := fmt.Sprintf("%s %s %s\n", result.method, result.url, result.status)
-		fmt.Fprintln(history_view, history_item)
-	case <-time.After(3 * time.Second):
-		fmt.Fprintln(out, "Error: Seems like something is wrong in your request :(")
-		doneChan <- true
+	history_view, err := g.View("history")
+	if err != nil {
+		return err
 	}
 
-	close(resultsChan)
-	<-doneChan
+	history_item := fmt.Sprintf("%s %s %s\n", result.method, result.url, result.status)
+	fmt.Fprintln(history_view, history_item)
 
 	return nil
 }
 
-func calculateDuration(start time.Time, v *ui.View) {
-	elapsed := time.Since(start).Seconds()
-	fmt.Fprintf(v, "Time: %f s\n", elapsed)
-}
-
-func httpRequest(url, method string, body []byte, v *ui.View, ch chan Result, done chan<- bool) error {
-	start := time.Now()
-	defer calculateDuration(start, v)
-
+func httpRequest(url, method string, body []byte) Result {
 	client := &http.Client{}
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	req.Header.Add("content-type", "application/json")
 	if err != nil {
-		return err
+		return Result{err: err}
 	}
 
 	res, err := client.Do(req)
 	if err != nil {
-		return err
+		return Result{err: err}
 	}
 
 	defer res.Body.Close()
@@ -369,15 +367,11 @@ func httpRequest(url, method string, body []byte, v *ui.View, ch chan Result, do
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return err
+		return Result{err: err}
 	}
 
 	r.body = string(b)
-
-	ch <- r
-	done <- true
-
-	return nil
+	return r
 }
 
 func formatResponse(result Result) string {
@@ -434,6 +428,33 @@ func quit(g *ui.Gui, v *ui.View) error {
 
 func clear(g *ui.Gui, v *ui.View) error {
 	return clearView(v)
+}
+
+func createPopup(g *ui.Gui, message string) error {
+	maxX, maxY := g.Size()
+	if v, err := g.SetView("popup", maxX/2-30, maxY/2, maxX/2+30, maxY/2+2); err != nil {
+		if err != ui.ErrUnknownView {
+			return err
+		}
+		fmt.Fprintln(v, message)
+		if _, err := g.SetCurrentView("popup"); err != nil {
+			return err
+		}
+		if _, err := g.SetViewOnTop("popup"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removePopup(g *ui.Gui, v *ui.View) error {
+	if err := g.DeleteView("popup"); err != nil {
+		return err
+	}
+	if _, err := g.SetCurrentView("input-bar"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func clearView(v *ui.View) error {
